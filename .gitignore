@@ -5,6 +5,7 @@ partiful_profile.json
 # Run outputs
 rsvp_log.csv
 rsvp_filtered.csv
+go_event_cache.json
 
 # Python
 __pycache__/
@@ -18,3 +19,6 @@ venv/
 .vscode/
 .idea/
 .DS_Store
+
+.venv/
+src/*.egg-info/

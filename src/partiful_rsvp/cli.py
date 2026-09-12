@@ -54,6 +54,7 @@ LOG_FILE = Path("rsvp_log.csv")
 
 _PARTIFUL_URL_RE = re.compile(r"partiful\.com/e/[A-Za-z0-9]+")
 _NEXT_DATA_RE = re.compile(r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', re.S)
+_GO_EVENT_RE = re.compile(r"/go/event/[A-Za-z0-9_\-]+")
 
 UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
       "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
@@ -262,11 +263,17 @@ async def cmd_login(phone: Optional[str] = None, auto: bool = True) -> None:
             _print_manual_login_instructions()
             input("Press ENTER once logged in... ")
 
-        await context.storage_state(path=str(STATE_FILE))
+        await context.storage_state(path=str(STATE_FILE), indexed_db=True)
         print(f"\n✓ saved login state to {STATE_FILE}")
 
         # Pull what we can from the live Partiful session.
         ext_name, ext_phone = await _extract_user_info(page)
+        if not ext_phone and not ext_name:
+            print()
+            print("  !! No Partiful auth record found — the login did not complete.")
+            print("     The saved session is logged out, so every RSVP would skip with")
+            print("     'not_logged_in'. Re-run `partiful-rsvp login --no-auto`, and make")
+            print("     sure your own event feed is on screen before pressing ENTER.")
         await browser.close()
 
     # Build the profile from system sources + Partiful. No prompts.
@@ -304,36 +311,95 @@ async def cmd_login(phone: Optional[str] = None, auto: bool = True) -> None:
 # calendar scrape
 # =========================================================================
 
-async def scroll_calendar(calendar_url: str) -> list[str]:
-    """Scroll a Tech Week (or any infinite-scroll) calendar page in headless
-    Chromium until no new Partiful event URLs appear. Returns sorted URLs."""
+async def scroll_calendar_cards(calendar_url: str) -> list[dict]:
+    """Scroll a Tech Week (or any infinite-scroll) calendar and return one dict
+    per event: {"url", "title", "hosts"}.
+
+    Tech Week no longer puts partiful.com links in the calendar HTML. Every
+    event is now an opaque /go/event/<token> on tech-week.com that 302s to the
+    real host. We keep those URLs as-is rather than pre-resolving them: the
+    endpoint hard-blocks bulk access (403/429 within a few dozen requests, and
+    plain urllib is refused outright), but a normal browser navigation follows
+    the redirect fine. Since the RSVP loop already visits every event with a
+    30-60s delay, letting page.goto() follow the 302 costs zero extra requests
+    and stays under the block threshold.
+
+    The anchor text carries the title and hosts, so --types can filter without
+    fetching anything. Note this filters on title + hosts only, not the event
+    description -- pulling descriptions would mean one request per event."""
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
         try:
-            page = await browser.new_page(viewport={"width": 1400, "height": 900})
+            context = await browser.new_context(viewport={"width": 1400, "height": 900},
+                                                user_agent=UA)
+            page = await context.new_page()
             log.info("scrolling %s", calendar_url)
             await page.goto(calendar_url, wait_until="networkidle", timeout=45_000)
             prev, stable = 0, 0
             for i in range(80):
+                n = await page.evaluate(
+                    "document.querySelectorAll('table tbody tr:has(a[href*=\"/go/event/\"])')"
+                    ".length")
                 html = await page.content()
-                urls = set(_PARTIFUL_URL_RE.findall(html))
+                direct = len(set(_PARTIFUL_URL_RE.findall(html)))
                 if i % 5 == 0:
-                    log.info("  scroll #%d: %d events", i, len(urls))
-                if len(urls) == prev:
+                    log.info("  scroll #%d: %d events (%d redirect, %d direct)",
+                             i, n + direct, n, direct)
+                if n + direct == prev:
                     stable += 1
                     if stable >= 3:
                         break
                 else:
                     stable = 0
-                prev = len(urls)
+                prev = n + direct
                 await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
                 await page.wait_for_timeout(1200)
+
+            # The calendar is a table: TIME | EVENT | HOST | NEIGHBORHOOD.
+            # (Anchors outside the table belong to the hero marquee and are
+            # duplicates -- each anchor gets its own /go/event/ token, so
+            # scraping anchors instead of rows badly overcounts.)
+            cards = await page.evaluate(r"""() => {
+              const out = [];
+              for (const tr of document.querySelectorAll('table tbody tr')) {
+                const a = tr.querySelector('a[href*="/go/event/"]');
+                if (!a) continue;
+                const cells = [...tr.querySelectorAll('td')]
+                                .map(td => (td.innerText || '').trim());
+                if (cells.length < 2) continue;
+                const [time, title, host, hood] = cells;
+                if (!title) continue;
+                out.push({
+                  url: new URL(a.getAttribute('href'), location.origin).href,
+                  title: title,
+                  hosts: host ? host.split(',').map(h => h.trim()).filter(Boolean) : [],
+                  time: time || '',
+                  neighborhood: hood || '',
+                });
+              }
+              return out;
+            }""")
+            # older calendars with plain partiful links still work
             html = await page.content()
-            urls = sorted({"https://" + u for u in _PARTIFUL_URL_RE.findall(html)})
+            for u in sorted(set(_PARTIFUL_URL_RE.findall(html))):
+                cards.append({"url": "https://" + u, "title": "", "hosts": [],
+                              "time": "", "neighborhood": ""})
         finally:
             await browser.close()
-    log.info("calendar done: %d unique events", len(urls))
-    return urls
+
+    seen, uniq = set(), []
+    for c in cards:
+        if c["url"] in seen:
+            continue
+        seen.add(c["url"])
+        uniq.append(c)
+    log.info("calendar done: %d unique events", len(uniq))
+    return uniq
+
+
+async def scroll_calendar(calendar_url: str) -> list[str]:
+    """Back-compat wrapper: just the event URLs."""
+    return [c["url"] for c in await scroll_calendar_cards(calendar_url)]
 
 
 # =========================================================================
@@ -473,8 +539,40 @@ async def _extract_user_info(page: Page) -> tuple[Optional[str], Optional[str]]:
         """)
     except Exception:
         return (None, None)
-    if isinstance(data, dict):
+    if isinstance(data, dict) and (data.get("name") or data.get("phone")):
         return (data.get("name"), data.get("phone"))
+
+    # Firebase v9+ keeps the signed-in user in IndexedDB, not localStorage.
+    try:
+        idb = await page.evaluate(r"""async () => {
+          const rows = await new Promise((resolve) => {
+            let req;
+            try { req = indexedDB.open('firebaseLocalStorageDb'); }
+            catch (e) { return resolve(null); }
+            req.onerror = () => resolve(null);
+            req.onsuccess = () => {
+              const db = req.result;
+              if (!db.objectStoreNames.contains('firebaseLocalStorage')) return resolve(null);
+              const all = db.transaction('firebaseLocalStorage', 'readonly')
+                            .objectStore('firebaseLocalStorage').getAll();
+              all.onsuccess = () => resolve(all.result);
+              all.onerror = () => resolve(null);
+            };
+            setTimeout(() => resolve(null), 4000);
+          });
+          const out = {name: null, phone: null};
+          for (const r of rows || []) {
+            const v = (r && r.value) ? r.value : r;
+            if (!v) continue;
+            if (v.phoneNumber && !out.phone) out.phone = v.phoneNumber;
+            if (v.displayName && !out.name) out.name = v.displayName;
+          }
+          return out;
+        }""")
+    except Exception:
+        return (None, None)
+    if isinstance(idb, dict):
+        return (idb.get("name"), idb.get("phone"))
     return (None, None)
 
 
@@ -794,9 +892,14 @@ async def _rsvp_one(page: Page, url: str, *, dry_run: bool,
     """RSVP to one event. If debug=True, screenshots at each stage and
     keeps the browser open longer so a human can watch."""
     try:
+        # A tech-week.com /go/event/<token> URL 302s to the real event here.
         await page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
     except PWTimeout:
         return ("navigate", "timeout")
+    if "/go/event/" in url:
+        if "partiful.com" not in page.url:
+            return ("skip", f"not_a_partiful_event | {page.url[:60]}")
+        log.info("    -> %s", page.url)
     # React/Next hydration window — without this we look for buttons before
     # the app finishes rendering and almost always miss them.
     try:
@@ -817,7 +920,7 @@ async def _rsvp_one(page: Page, url: str, *, dry_run: bool,
         return ("skip", f"event_ended | {title[:80]}")
     if any(t in page_text for t in ("you're going", "you're attending", "you're in",
                                      "you applied", "you've applied",
-                                     "application pending",
+                                     "application pending", "you're on the list",
                                      "you're on the waitlist", "you're waitlisted")):
         return ("skip", f"already_rsvpd | {title[:80]}")
 
@@ -843,7 +946,17 @@ async def _rsvp_one(page: Page, url: str, *, dry_run: bool,
         "button:has-text('Waitlist')",
     ]
     btn = None
-    for sel in candidates:
+    # Approval-gated events use "Get on the list" rather than an RSVP button.
+    # It is written with non-breaking spaces, so CSS text matching misses it,
+    # and a plain has-text() would grab the adjacent "Get on the list for full
+    # location" teaser instead. Role + exact accessible name gets the real one.
+    try:
+        loc = page.get_by_role("button", name="Get on the list", exact=True).first
+        if await loc.is_visible(timeout=1_500):
+            btn = loc
+    except Exception:
+        pass
+    for sel in ([] if btn is not None else candidates):
         try:
             loc = page.locator(sel).first
             if await loc.is_visible(timeout=1500):
@@ -852,6 +965,18 @@ async def _rsvp_one(page: Page, url: str, *, dry_run: bool,
         except Exception:
             continue
     if btn is None:
+        # Distinguish "signed out" from "this event has no RSVP control".
+        # Logged-out Partiful shows a Login button where the logged-in nav
+        # shows Create. (Do NOT test for "get on the list" here -- logged-in
+        # approval-gated events show that too.)
+        try:
+            signed_out = await page.get_by_role(
+                "button", name=re.compile(r"^\s*(log ?in|sign ?in)\s*$", re.I)
+            ).first.is_visible(timeout=1_500)
+        except Exception:
+            signed_out = False
+        if signed_out:
+            return ("skip", f"not_logged_in | {title[:80]}")
         return ("skip", f"no_rsvp_button_found | {title[:80]}")
     if dry_run:
         try:
@@ -1076,7 +1201,7 @@ async def _rsvp_one(page: Page, url: str, *, dry_run: bool,
         if any(t in post_text for t in ("you're going", "you're attending", "you're in",
                                         "you applied", "you've applied",
                                         "pending approval", "request submitted", "request sent",
-                                        "you're on the waitlist")):
+                                        "you're on the list", "you're on the waitlist")):
             return ("rsvp", f"success | {title[:80]}")
     except Exception:
         pass
@@ -1115,9 +1240,12 @@ async def cmd_rsvp(
         log.error(f"no login state at {STATE_FILE} — run `python3 rsvp_bot.py login` first")
         sys.exit(1)
 
-    # Source URLs
+    # Source URLs. Calendar scraping also yields title/hosts per event, which
+    # lets --types filter without a request per event.
+    cards: Optional[list[dict]] = None
     if calendar_url:
-        urls = await scroll_calendar(calendar_url)
+        cards = await scroll_calendar_cards(calendar_url)
+        urls = [c["url"] for c in cards]
     elif urls_file:
         urls = [u.strip() for u in urls_file.read_text().splitlines()
                 if u.strip() and not u.startswith("#")]
@@ -1130,10 +1258,20 @@ async def cmd_rsvp(
         type_list = _normalize_types(types)
         log.info("filtering %d events against types: %s", len(urls), type_list)
         kept: list[tuple[str, str]] = []  # (url, why_matched)
+        by_url = {c["url"]: c for c in (cards or [])}
         for i, u in enumerate(urls, 1):
             if i % 25 == 0:
                 log.info("  filter %d/%d — keeping %d so far", i, len(urls), len(kept))
-            meta = _fetch_event_meta(u)
+            card = by_url.get(u)
+            if card and card.get("title"):
+                # Title + hosts from the calendar itself; no request needed.
+                # No description without a request per event; the
+                # neighbourhood is included so --types can match on location.
+                meta = {"url": u, "title": card["title"],
+                        "description": card.get("neighborhood", ""),
+                        "hosts": card["hosts"]}
+            else:
+                meta = _fetch_event_meta(u)
             if not meta:
                 continue
             if use_llm:
@@ -1232,7 +1370,8 @@ async def cmd_rsvp(
                 log.info("    sleeping %.1fs", wait)
                 await asyncio.sleep(wait)
         try:
-            await context.storage_state(path=str(STATE_FILE))
+            # indexed_db=True keeps the Firebase auth record alive between runs.
+            await context.storage_state(path=str(STATE_FILE), indexed_db=True)
         except Exception:
             pass
         await browser.close()
